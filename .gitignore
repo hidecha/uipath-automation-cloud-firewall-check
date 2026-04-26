@@ -1,0 +1,13 @@
+# Script output
+AutomationCloudFirewall-CheckResult*.csv
+
+# OS / Editor
+Thumbs.db
+.DS_Store
+.vs/
+.vscode/
+*.swp
+*~
+
+# Claude Code
+.claude/
