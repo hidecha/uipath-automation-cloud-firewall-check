@@ -151,6 +151,8 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 > **About HTTP 403**: A 403 response is classified by looking at who returned it:
 > - **Fail** — the 403 came from an intermediate proxy (detected via generic markers: `Via`, `Proxy-Connection`, `X-Cache`, `X-Cache-Lookup`, a `Server` header containing `proxy` / `cache` / `gateway`, or error-page body markers such as `proxy`, `gateway`, `cache administrator`, or the phrase `requested URL could not be retrieved`). The request was blocked before reaching the origin, so the firewall/proxy requirement is not satisfied.
 > - **Warn** — the 403 came from the origin web server (none of the proxy markers are present). Reachability itself is fine; the server simply returned 403 for an unauthenticated GET against the root path.
+>
+> Proxy-origin detection is **skipped when no system proxy is configured** for the URL, because in that case a 403 cannot have come from a corporate blocking proxy. This avoids false `Fail` results when the origin or its CDN happens to emit markers the generic detector would otherwise pick up (e.g. Azure Front Door in front of `pkgs.dev.azure.com` returning `X-Cache` headers or the word `gateway` in its error page).
 
 > **Tip**: From a firewall requirement standpoint, **`Warn` is acceptable**. 4xx/5xx commonly happen when the server requires authentication or when the root path simply serves no content, and do not indicate a reachability problem.
 >

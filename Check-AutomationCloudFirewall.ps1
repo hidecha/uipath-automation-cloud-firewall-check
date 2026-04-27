@@ -1184,6 +1184,22 @@ function Test-UrlConnection {
         # We received an HTTP status => the server was reached (but 407 is still Fail).
         if ($null -ne $code) {
             if ($code -eq 403) {
+                # If no system proxy is configured for this URL, the 403
+                # cannot have come from a corporate blocking proxy - any
+                # X-Cache / Via header would belong to a legitimate upstream
+                # CDN (e.g. Azure Front Door in front of pkgs.dev.azure.com)
+                # and any "gateway" / "proxy" token in the error body is
+                # incidental. Skip the proxy-origin detection entirely and
+                # classify as Warn.
+                $systemProxy = Get-SystemProxyForUrl -Url $Url
+                if (-not $systemProxy) {
+                    return [PSCustomObject]@{
+                        Status    = 'Warn'
+                        Detail    = 'HTTP 403 (reachable / server returned error)'
+                        ElapsedMs = $elapsedMs
+                    }
+                }
+
                 $respForHeaders = $null
                 try { $respForHeaders = $ex.Response } catch { }
 
