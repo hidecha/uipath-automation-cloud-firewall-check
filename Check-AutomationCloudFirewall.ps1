@@ -1490,7 +1490,7 @@ foreach ($item in $urlList) {
     $originalUrl = $item.Url
     $purpose     = $item.Purpose
 
-    Write-Progress -Activity "Firewall reachability check" `
+    Write-Progress -Activity "Automation Cloud reachability check" `
                    -Status "$index / $total : $originalUrl" `
                    -PercentComplete (($index / $total) * 100)
 
@@ -1535,7 +1535,7 @@ foreach ($item in $urlList) {
     })
 }
 
-Write-Progress -Activity "Firewall reachability check" -Completed
+Write-Progress -Activity "Automation Cloud reachability check" -Completed
 
 # -------------------------------------------------------------------
 # CSV output (UTF-8 BOM so Excel opens it cleanly)
