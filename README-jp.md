@@ -17,6 +17,8 @@ UiPath Automation Cloud をネットワークから利用するために許可�
 - 各 URL の **応答時間 (ms)** を計測して記録
 - 結果を **UTF-8 BOM 付き CSV** に出力（Excel でそのまま開いても文字化けしない）
 - 判定区分は **Pass / Warn / Fail / Skip** の 4 種類
+- **HTTP 407 (プロキシ認証要求) を受けた場合は Negotiate / Kerberos / NTLM (Windows 統合認証) を使って現在ログオン中の OS 資格情報で自動リトライ**。対話プロンプトは出ません。
+- **HTTP 403 は「中間プロキシによる遮断 (Fail)」と「Web サーバ側の 403 応答 (Warn)」を自動で切り分け**。判定はベンダ非依存の汎用シグナルに基づきます。
 
 ---
 
@@ -27,9 +29,11 @@ UiPath Automation Cloud をネットワークから利用するために許可�
 | OS | Windows 10 / 11, Windows Server 2016+ |
 | PowerShell | Windows PowerShell 5.1 または PowerShell 7.x どちらも動作 |
 | ネットワーク | チェック対象 URL へ HTTPS (443 / 80) で発信可能であること |
-| プロキシ | システム設定のプロキシ (IE/Edge 設定) が自動で使われます |
+| プロキシ | システム設定のプロキシ (IE/Edge 設定) が自動で使われます。Kerberos / NTLM / Negotiate 認証のプロキシは現在の Windows 資格情報で透過的に通過します |
 
 > ※ 社内プロキシ経由では一部 URL が 4xx/5xx を返す場合があります（`Warn` 扱い）。疎通そのものは成立しているため、ファイアウォール要件としては到達可能と判断できます。
+>
+> **HTTP 403 は特別扱い**: 中間プロキシが返した 403 (= 上流で遮断されている状態) は `Fail`、Web サーバ自身が返した 403 は `Warn` に分類されます（詳細は後述の「判定ルール」）。
 
 ---
 
@@ -107,11 +111,15 @@ CSV のヘッダー行は英語です。
 | 判定 | 意味 | 代表的なケース |
 |---|---|---|
 | **Pass** | HTTP 2xx / 3xx で正常応答。ネットワーク到達 OK | `HTTP 200`, `HTTP 301` |
-| **Warn** | HTTP 4xx / 5xx 応答。**ネットワークは到達している** がサーバ側でエラー応答 | `HTTP 400`, `HTTP 401`, `HTTP 403`, `HTTP 404`, `HTTP 500` |
-| **Fail** | **ネットワーク到達不可**、またはプロキシ認証が必要。ファイアウォール / プロキシ / DNS の問題が疑われる | タイムアウト / 名前解決失敗 / 接続拒否 / SSL・TLS エラー / **HTTP 407 (プロキシ認証要求)** |
+| **Warn** | **Web サーバ自身** が返した HTTP 4xx / 5xx 応答。ネットワークは到達しており、サーバがエラーを返しているだけ | `HTTP 400`, `HTTP 401`, `HTTP 403` (オリジン発)`, `HTTP 404`, `HTTP 500` |
+| **Fail** | **ネットワーク到達不可**、または中間プロキシによる遮断 / 認証拒否。ファイアウォール / プロキシ / DNS の問題が疑われる | タイムアウト / 名前解決失敗 / 接続拒否 / SSL・TLS エラー / **HTTP 407 (統合認証リトライ後も拒否)** / **HTTP 403 (中間プロキシ発)** |
 | **Skip** | チェック対象外 | URL にワイルドカード `*` を含む |
 
-> **HTTP 407 の扱い**: `407 Proxy Authentication Required` はプロキシが認証を要求している状態で、UiPath のエンドポイントまでの到達が成立していません。ファイアウォール要件を満たさないため **Fail** として扱います。プロキシに認証情報を設定したうえで再実行してください。
+> **HTTP 407 の扱い**: `407 Proxy Authentication Required` はプロキシが認証を要求している状態です。`Proxy-Authenticate` ヘッダが Negotiate / Kerberos / NTLM を提示している場合、スクリプトは **現在ログオン中の Windows ユーザーの資格情報 (統合認証)** で自動的にリトライします。リトライが成功すれば **Pass** (オリジンが 4xx/5xx を返したときは **Warn**) になります。統合認証でも拒否された場合、またはプロキシが Basic 認証のみを提示する場合は **Fail** です。
+
+> **HTTP 403 の扱い**: 403 を誰が返したかで分類します。
+> - **Fail** — 中間プロキシが返した 403。判定には汎用 (ベンダ非依存) なシグナルを使用: `Via` / `Proxy-Connection` / `X-Cache` / `X-Cache-Lookup` ヘッダ、`Server` ヘッダに `proxy` / `cache` / `gateway` を含む、あるいはエラーページ本文に `proxy` / `gateway` / `cache administrator` / `requested URL could not be retrieved` といった語句が含まれる場合。上流に到達できていないためファイアウォール / プロキシ設定の見直しが必要です。
+> - **Warn** — Web サーバ自身が返した 403 (上記マーカーが一切検出されないケース)。ネットワーク到達性自体は問題なく、サーバがルートパスに対して未認証 GET を拒否しているだけのことが多いです。
 
 > **ポイント**: ファイアウォール要件の観点では **Warn は許容** です。4xx/5xx は「サーバに到達した上で認証が必要」「そもそもルートパスにコンテンツがない」といった理由で発生するためで、到達性に問題はありません。
 >
@@ -133,7 +141,8 @@ https://cloud.uipath.com,Automation Cloud portal / Basic authentication sign-in,
 https://platform-cdn.uipath.com,Automation Cloud portal / Basic authentication sign-in,Warn,308,HTTP 400 (reachable / server returned error)
 *-signalr.service.signalr.net,Automation Cloud portal / UiPath Assistant sign-in,Skip,,Contains wildcard - not checked directly
 https://service.signalr.net,Task Mining / SignalR,Fail,45,DNS resolution failure
-https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 (proxy authentication required)
+https://gallery.uipath.com,Automation Cloud portal / UiPath Studio sign-in,Fail,4,HTTP 403 from intermediate proxy (blocked upstream)
+https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 after retry (Negotiate, OS credentials rejected)
 ```
 
 ---

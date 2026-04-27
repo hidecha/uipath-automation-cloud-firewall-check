@@ -18,8 +18,27 @@
     - Pass : HTTP 2xx / 3xx response (network reachability OK).
     - Warn : HTTP 4xx / 5xx response (reached the server but it returned an error).
     - Fail : Timeout / DNS resolution failure / connection refused / SSL/TLS error,
-             or HTTP 407 (proxy authentication required - end-to-end not reached).
+             HTTP 407 (proxy authentication required), or HTTP 403 returned by an
+             intermediate proxy (the request did not reach the origin server).
     - Skip : URL contains a wildcard and cannot be checked directly.
+
+    403 handling:
+    A 403 response identified as originating from an intermediate proxy is
+    treated as Fail; a 403 that looks like it came from the origin web server
+    is recorded as Warn. Detection is vendor-neutral and uses two layers:
+      1) Headers: Via, Proxy-Connection, X-Cache, X-Cache-Lookup, or a Server
+         header containing "proxy", "cache", or "gateway".
+      2) Body fallback (used when headers are not available, as commonly
+         happens with HTTPS CONNECT failures on PowerShell 5.1): the HTML
+         error page is matched against generic markers such as the words
+         "proxy" / "gateway", phrases like "cache administrator", or the
+         classic forward-proxy phrase "requested URL could not be retrieved".
+
+    Proxy authentication:
+    When the initial request returns HTTP 407 and the Proxy-Authenticate header
+    offers Negotiate / Kerberos / NTLM, the request is retried using the current
+    Windows user's OS credentials (Integrated Authentication). The retry outcome
+    replaces the original 407 result.
 
     CSV columns:
         URL / Purpose / Result / ResponseTimeMs / Detail
@@ -60,6 +79,17 @@ if ([string]::IsNullOrEmpty($OutputPath)) {
 # Force TLS 1.2 for older PowerShell environments.
 [System.Net.ServicePointManager]::SecurityProtocol = `
     [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+# Make the system proxy use the current Windows user's credentials by default.
+# This lets Invoke-WebRequest pass through Kerberos/NTLM proxies transparently
+# on PowerShell 5.1, which does not always honor -ProxyUseDefaultCredentials on
+# the first attempt. PowerShell 7 generally picks this up as well.
+try {
+    $defaultProxy = [System.Net.WebRequest]::DefaultWebProxy
+    if ($null -ne $defaultProxy) {
+        $defaultProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }
+} catch { }
 
 # -------------------------------------------------------------------
 # URL / Purpose master list
@@ -296,6 +326,195 @@ function Get-HttpStatusFromError {
     return $null
 }
 
+function Get-ProxyAuthSchemes {
+    <#
+        Extracts the Proxy-Authenticate header values (scheme list such as
+        "Negotiate", "Kerberos", "NTLM", "Basic") from an HTTP 407 response.
+
+        Sources considered:
+          - Windows PowerShell 5.1 : System.Net.HttpWebResponse.Headers (WebHeaderCollection)
+          - PowerShell 7+          : System.Net.Http.HttpResponseMessage.Headers.ProxyAuthenticate
+    #>
+    param($ErrorRecord)
+
+    $schemes = New-Object System.Collections.Generic.List[string]
+
+    $resp = $null
+    try { $resp = $ErrorRecord.Exception.Response } catch { }
+    if ($null -eq $resp) { return $schemes }
+
+    # PowerShell 5.1 path: WebHeaderCollection exposes GetValues("Proxy-Authenticate").
+    try {
+        $hdrs = $resp.Headers
+        if ($hdrs -and $hdrs.GetType().GetMethod('GetValues')) {
+            $values = $null
+            try { $values = $hdrs.GetValues('Proxy-Authenticate') } catch { }
+            if ($values) {
+                foreach ($v in $values) {
+                    $head = ($v -split '[ ,]')[0]
+                    if ($head) { [void]$schemes.Add($head.Trim()) }
+                }
+                if ($schemes.Count -gt 0) { return $schemes }
+            }
+        }
+    } catch { }
+
+    # PowerShell 7 path: HttpResponseHeaders.ProxyAuthenticate is a collection
+    # of AuthenticationHeaderValue, each with a .Scheme.
+    try {
+        $pa = $resp.Headers.ProxyAuthenticate
+        if ($pa) {
+            foreach ($v in $pa) {
+                if ($v.Scheme) { [void]$schemes.Add([string]$v.Scheme) }
+            }
+        }
+    } catch { }
+
+    return $schemes
+}
+
+function Test-ProxySchemeIsIntegrated {
+    param($Schemes)
+    foreach ($s in $Schemes) {
+        if ($s -match '(?i)^(Negotiate|Kerberos|NTLM)$') { return $true }
+    }
+    return $false
+}
+
+function Get-ResponseHeaderValue {
+    <#
+        Reads a single header value from either a WebHeaderCollection
+        (Windows PowerShell 5.1 / HttpWebResponse) or an HttpResponseHeaders
+        instance (PowerShell 7+ / HttpResponseMessage).
+        Returns a single string with all values joined by ", ", or $null.
+    #>
+    param($Response, [string]$HeaderName)
+
+    if ($null -eq $Response) { return $null }
+
+    # PowerShell 5.1: WebHeaderCollection.GetValues(string)
+    try {
+        $hdrs = $Response.Headers
+        if ($hdrs -and $hdrs.GetType().GetMethod('GetValues')) {
+            $values = $null
+            try { $values = $hdrs.GetValues($HeaderName) } catch { }
+            if ($values) { return ($values -join ', ') }
+        }
+    } catch { }
+
+    # PowerShell 7+: HttpResponseHeaders.TryGetValues(string, out IEnumerable<string>)
+    try {
+        $hdrs = $Response.Headers
+        if ($hdrs) {
+            $out = $null
+            $ok  = $hdrs.TryGetValues($HeaderName, [ref]$out)
+            if ($ok -and $out) { return ($out -join ', ') }
+        }
+    } catch { }
+
+    return $null
+}
+
+function Test-ResponseIsFromProxy {
+    <#
+        Decides whether an HTTP response most likely came from an intermediate
+        proxy rather than from the origin web server, based on generic headers
+        only (no vendor-specific product names).
+
+        Signals considered:
+          - Via (RFC 9110 standard proxy marker)
+          - Proxy-Connection (non-standard but widely used)
+          - X-Cache / X-Cache-Lookup (common to forward/cache proxies)
+          - Server header containing the generic tokens "proxy", "cache",
+            or "gateway"
+    #>
+    param($Response)
+
+    if ($null -eq $Response) { return $false }
+
+    foreach ($name in @('Via', 'Proxy-Connection', 'X-Cache', 'X-Cache-Lookup')) {
+        $val = Get-ResponseHeaderValue -Response $Response -HeaderName $name
+        if ($val) { return $true }
+    }
+
+    $server = Get-ResponseHeaderValue -Response $Response -HeaderName 'Server'
+    if ($server -and ($server -match '(?i)\b(proxy|cache|gateway)\b')) { return $true }
+
+    return $false
+}
+
+function Get-ErrorResponseBody {
+    <#
+        Returns the HTTP response body from a failed Invoke-WebRequest call,
+        or $null when no body is available. PowerShell exposes the body in
+        two different places depending on the failure mode:
+          - $_.ErrorDetails.Message            (populated by Invoke-WebRequest)
+          - $_.Exception.Response stream       (raw WebResponse stream)
+    #>
+    param($ErrorRecord)
+
+    try {
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            return [string]$ErrorRecord.ErrorDetails.Message
+        }
+    } catch { }
+
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($null -ne $resp) {
+            $stream = $resp.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                return $reader.ReadToEnd()
+            }
+        }
+    } catch { }
+
+    return $null
+}
+
+function Test-BodyIsFromProxy {
+    <#
+        Looks for generic, vendor-neutral markers in an HTTP error page body
+        that suggest it was produced by an intermediate proxy / gateway /
+        caching product rather than by an origin web application.
+
+        Markers:
+          - the word "proxy" or "gateway"
+          - phrases like "cache administrator" / "cache manager" / "cache server"
+          - "requested URL could not be retrieved" (classic forward-proxy error)
+    #>
+    param([string]$Body)
+
+    if ([string]::IsNullOrEmpty($Body)) { return $false }
+
+    if ($Body -match '(?i)\b(proxy|gateway)\b')                       { return $true }
+    if ($Body -match '(?i)cache\s+(administrator|manager|server)')    { return $true }
+    if ($Body -match '(?i)requested\s+URL\s+could\s+not\s+be\s+retrieved') { return $true }
+
+    return $false
+}
+
+function Get-SystemProxyForUrl {
+    <#
+        Returns the system proxy URL (string) for the target $Url, or $null
+        when no proxy is configured or cannot be resolved.
+    #>
+    param([string]$Url)
+    try {
+        $proxy = [System.Net.WebRequest]::DefaultWebProxy
+        if ($null -eq $proxy) { return $null }
+        $target   = [Uri]$Url
+        $proxyUri = $proxy.GetProxy($target)
+        if ($null -eq $proxyUri) { return $null }
+        # GetProxy returns the original URI when no proxy is configured for it.
+        if ($proxyUri.AbsoluteUri -eq $target.AbsoluteUri) { return $null }
+        return $proxyUri.AbsoluteUri
+    } catch {
+        return $null
+    }
+}
+
 function Test-UrlConnection {
     param(
         [string]$Url,
@@ -330,10 +549,101 @@ function Test-UrlConnection {
 
         # We received an HTTP status => the server was reached (but 407 is still Fail).
         if ($null -ne $code) {
+            if ($code -eq 403) {
+                $respForHeaders = $null
+                try { $respForHeaders = $ex.Response } catch { }
+
+                $fromProxy = Test-ResponseIsFromProxy -Response $respForHeaders
+
+                # Body-level fallback: HTTPS CONNECT failures often do not
+                # surface the proxy's response headers on PowerShell 5.1,
+                # but the HTML error page body is still available via
+                # ErrorDetails.Message.
+                if (-not $fromProxy) {
+                    $body = Get-ErrorResponseBody -ErrorRecord $err
+                    if (Test-BodyIsFromProxy -Body $body) { $fromProxy = $true }
+                }
+
+                if ($fromProxy) {
+                    return [PSCustomObject]@{
+                        Status    = 'Fail'
+                        Detail    = 'HTTP 403 from intermediate proxy (blocked upstream)'
+                        ElapsedMs = $elapsedMs
+                    }
+                }
+
+                return [PSCustomObject]@{
+                    Status    = 'Warn'
+                    Detail    = 'HTTP 403 (reachable / server returned error)'
+                    ElapsedMs = $elapsedMs
+                }
+            }
             if ($code -eq 407) {
+                $schemes      = Get-ProxyAuthSchemes -ErrorRecord $err
+                $schemesLabel = if ($schemes.Count -gt 0) { ($schemes -join ', ') } else { 'unknown' }
+
+                if (Test-ProxySchemeIsIntegrated -Schemes $schemes) {
+                    # Retry with Windows Integrated Authentication (Negotiate/Kerberos/NTLM)
+                    # using the current OS credentials. Pass the system proxy explicitly
+                    # so that -ProxyUseDefaultCredentials takes effect on both PS 5.1 and PS 7.
+                    $proxyUrl = Get-SystemProxyForUrl -Url $Url
+                    $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+                    try {
+                        $iwrParams = @{
+                            Uri                       = $Url
+                            Method                    = 'Get'
+                            UseBasicParsing           = $true
+                            TimeoutSec                = $TimeoutSec
+                            MaximumRedirection        = 5
+                            ErrorAction               = 'Stop'
+                            UseDefaultCredentials     = $true
+                            ProxyUseDefaultCredentials = $true
+                        }
+                        if ($proxyUrl) { $iwrParams['Proxy'] = $proxyUrl }
+
+                        $resp2 = Invoke-WebRequest @iwrParams
+                        $sw2.Stop()
+                        return [PSCustomObject]@{
+                            Status    = 'Pass'
+                            Detail    = "HTTP $([int]$resp2.StatusCode) (proxy auth via $schemesLabel, OS credentials)"
+                            ElapsedMs = [int]$sw2.ElapsedMilliseconds
+                        }
+                    } catch {
+                        $sw2.Stop()
+                        $elapsed2 = [int]$sw2.ElapsedMilliseconds
+                        $code2    = Get-HttpStatusFromError -ErrorRecord $_
+                        if ($null -ne $code2) {
+                            if ($code2 -eq 407) {
+                                return [PSCustomObject]@{
+                                    Status    = 'Fail'
+                                    Detail    = "HTTP 407 after retry ($schemesLabel, OS credentials rejected)"
+                                    ElapsedMs = $elapsed2
+                                }
+                            }
+                            if ($code2 -ge 200 -and $code2 -lt 400) {
+                                return [PSCustomObject]@{
+                                    Status    = 'Pass'
+                                    Detail    = "HTTP $code2 (proxy auth via $schemesLabel, OS credentials)"
+                                    ElapsedMs = $elapsed2
+                                }
+                            }
+                            return [PSCustomObject]@{
+                                Status    = 'Warn'
+                                Detail    = "HTTP $code2 after proxy auth via $schemesLabel (server returned error)"
+                                ElapsedMs = $elapsed2
+                            }
+                        }
+                        return [PSCustomObject]@{
+                            Status    = 'Fail'
+                            Detail    = "Proxy auth retry failed ($schemesLabel): $($_.Exception.Message)"
+                            ElapsedMs = $elapsed2
+                        }
+                    }
+                }
+
                 return [PSCustomObject]@{
                     Status    = 'Fail'
-                    Detail    = 'HTTP 407 (proxy authentication required)'
+                    Detail    = "HTTP 407 (proxy authentication required; scheme=$schemesLabel)"
                     ElapsedMs = $elapsedMs
                 }
             }

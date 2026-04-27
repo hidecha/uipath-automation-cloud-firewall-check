@@ -17,6 +17,12 @@ Reference: [Configuring the firewall for Automation Cloud (UiPath official docum
 - **Response time (ms)** is measured and recorded for every URL.
 - Output is written as a **UTF-8 BOM CSV** (opens cleanly in Excel without garbling).
 - Four result categories: **Pass / Warn / Fail / Skip**.
+- **HTTP 407 (proxy authentication required) is retried automatically** with the
+  current Windows user's credentials when the proxy offers Negotiate / Kerberos
+  / NTLM (Windows Integrated Authentication). No interactive prompt is shown.
+- **HTTP 403 is split** into `Fail` (blocked by an intermediate proxy) and
+  `Warn` (returned by the origin web server). The decision is made from
+  generic, vendor-neutral signals in the response headers and body.
 
 ---
 
@@ -27,9 +33,11 @@ Reference: [Configuring the firewall for Automation Cloud (UiPath official docum
 | OS | Windows 10 / 11, Windows Server 2016+ |
 | PowerShell | Windows PowerShell 5.1 or PowerShell 7.x (both work) |
 | Network | Outbound HTTPS (443 / 80) must be permitted to the target URLs |
-| Proxy | The system proxy (IE/Edge settings) is used automatically |
+| Proxy | The system proxy (IE/Edge settings) is used automatically. Kerberos / NTLM / Negotiate proxies are supported with the current Windows credentials. |
 
 > Some URLs may return 4xx/5xx through a corporate proxy and will be reported as `Warn`. Reachability itself is established, so for firewall requirement purposes the target can be considered reachable.
+>
+> **HTTP 403** is special-cased: a 403 produced by an intermediate proxy (blocking upstream) is reported as `Fail`, while a 403 returned by the origin web server is reported as `Warn` (see *Decision rules* below).
 
 ---
 
@@ -105,11 +113,15 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 | Result | Meaning | Typical cases |
 |---|---|---|
 | **Pass** | HTTP 2xx / 3xx response. Network reachability OK. | `HTTP 200`, `HTTP 301` |
-| **Warn** | HTTP 4xx / 5xx response. **The network is reachable** but the server responded with an error. | `HTTP 400`, `HTTP 401`, `HTTP 403`, `HTTP 404`, `HTTP 500` |
-| **Fail** | **Network unreachable**, or proxy authentication required. The firewall / proxy / DNS is likely to blame. | Timeout / DNS failure / connection refused / SSL/TLS error / **HTTP 407 (proxy authentication required)** |
+| **Warn** | HTTP 4xx / 5xx response returned by the **origin web server**. The network is reachable; the server itself responded with an error. | `HTTP 400`, `HTTP 401`, `HTTP 403` (from origin), `HTTP 404`, `HTTP 500` |
+| **Fail** | **Network unreachable**, or the request was blocked / authenticated by an intermediate proxy. The firewall / proxy / DNS is likely to blame. | Timeout / DNS failure / connection refused / SSL/TLS error / **HTTP 407 (proxy authentication rejected after integrated-auth retry)** / **HTTP 403 returned by an intermediate proxy** |
 | **Skip** | Not checked | URL contains the wildcard `*` |
 
-> **About HTTP 407**: `407 Proxy Authentication Required` means the proxy is requesting authentication and the UiPath endpoint itself has not been reached. The firewall requirement is therefore **not** satisfied, so this is treated as **Fail**. Configure credentials on the proxy and re-run.
+> **About HTTP 407**: `407 Proxy Authentication Required` means the proxy is requesting authentication. If the `Proxy-Authenticate` header offers Negotiate / Kerberos / NTLM, the script automatically retries the request using the **current Windows user's credentials** (Integrated Authentication). If the retry succeeds, the result is **Pass** (or **Warn** for a 4xx/5xx from the origin). If the retry is still rejected, or the proxy only offers Basic authentication, the URL is reported as **Fail**.
+
+> **About HTTP 403**: A 403 response is classified by looking at who returned it:
+> - **Fail** — the 403 came from an intermediate proxy (detected via generic markers: `Via`, `Proxy-Connection`, `X-Cache`, `X-Cache-Lookup`, a `Server` header containing `proxy` / `cache` / `gateway`, or error-page body markers such as `proxy`, `gateway`, `cache administrator`, or the phrase `requested URL could not be retrieved`). The request was blocked before reaching the origin, so the firewall/proxy requirement is not satisfied.
+> - **Warn** — the 403 came from the origin web server (none of the proxy markers are present). Reachability itself is fine; the server simply returned 403 for an unauthenticated GET against the root path.
 
 > **Tip**: From a firewall requirement standpoint, **`Warn` is acceptable**. 4xx/5xx commonly happen when the server requires authentication or when the root path simply serves no content, and do not indicate a reachability problem.
 >
@@ -130,7 +142,8 @@ https://cloud.uipath.com,Automation Cloud portal / Basic authentication sign-in,
 https://platform-cdn.uipath.com,Automation Cloud portal / Basic authentication sign-in,Warn,308,HTTP 400 (reachable / server returned error)
 *-signalr.service.signalr.net,Automation Cloud portal / UiPath Assistant sign-in,Skip,,Contains wildcard - not checked directly
 https://service.signalr.net,Task Mining / SignalR,Fail,45,DNS resolution failure
-https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 (proxy authentication required)
+https://gallery.uipath.com,Automation Cloud portal / UiPath Studio sign-in,Fail,4,HTTP 403 from intermediate proxy (blocked upstream)
+https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 after retry (Negotiate, OS credentials rejected)
 ```
 
 ---
