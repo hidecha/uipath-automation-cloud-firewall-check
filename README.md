@@ -17,9 +17,15 @@ Reference: [Configuring the firewall for Automation Cloud (UiPath official docum
 - **Response time (ms)** is measured and recorded for every URL.
 - Output is written as a **UTF-8 BOM CSV** (opens cleanly in Excel without garbling).
 - Four result categories: **Pass / Warn / Fail / Skip**.
-- **HTTP 407 (proxy authentication required) is retried automatically** with the
-  current Windows user's credentials when the proxy offers Negotiate / Kerberos
-  / NTLM (Windows Integrated Authentication). No interactive prompt is shown.
+- **HTTP 407 (proxy authentication required) is retried automatically**:
+  - **Negotiate / Kerberos / NTLM** → the current Windows user's credentials
+    (Windows Integrated Authentication).
+  - **Basic** → credentials read from the local UiPath proxy configuration
+    files (`C:\ProgramData\UiPath\Shared\proxy.json`, with
+    `C:\Program Files\UiPath\Studio\uipath.config` as a fallback). Both the
+    plain `UserName` and `Domain\UserName` forms are tried when a Domain is
+    configured, because proxies differ in which form they expect.
+  - No interactive prompt is shown.
 - **HTTP 403 is split** into `Fail` (blocked by an intermediate proxy) and
   `Warn` (returned by the origin web server). The decision is made from
   generic, vendor-neutral signals in the response headers and body.
@@ -33,7 +39,7 @@ Reference: [Configuring the firewall for Automation Cloud (UiPath official docum
 | OS | Windows 10 / 11, Windows Server 2016+ |
 | PowerShell | Windows PowerShell 5.1 or PowerShell 7.x (both work) |
 | Network | Outbound HTTPS (443 / 80) must be permitted to the target URLs |
-| Proxy | The system proxy (IE/Edge settings) is used automatically. Kerberos / NTLM / Negotiate proxies are supported with the current Windows credentials. |
+| Proxy | The system proxy (IE/Edge settings) is used automatically. Kerberos / NTLM / Negotiate proxies are supported with the current Windows credentials. Basic-authentication proxies are supported by reading credentials from the local UiPath config files (see [HTTP 407 handling](#about-http-407)). |
 
 > Some URLs may return 4xx/5xx through a corporate proxy and will be reported as `Warn`. Reachability itself is established, so for firewall requirement purposes the target can be considered reachable.
 >
@@ -95,6 +101,7 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 |---|---|---|
 | `-OutputPath` | `{script folder}\AutomationCloudFirewall-CheckResult.csv` | Destination path of the CSV |
 | `-TimeoutSec` | `15` | Connection timeout (seconds) per URL |
+| `-DebugProxyAuth` | off | Prints a wire-level CONNECT trace for each Basic-auth variant. Use only when investigating a 407 - the trace includes the proxy's error page body and a partially masked Base64 token. |
 
 ---
 
@@ -117,7 +124,29 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 | **Fail** | **Network unreachable**, or the request was blocked / authenticated by an intermediate proxy. The firewall / proxy / DNS is likely to blame. | Timeout / DNS failure / connection refused / SSL/TLS error / **HTTP 407 (proxy authentication rejected after integrated-auth retry)** / **HTTP 403 returned by an intermediate proxy** |
 | **Skip** | Not checked | URL contains the wildcard `*` |
 
-> **About HTTP 407**: `407 Proxy Authentication Required` means the proxy is requesting authentication. If the `Proxy-Authenticate` header offers Negotiate / Kerberos / NTLM, the script automatically retries the request using the **current Windows user's credentials** (Integrated Authentication). If the retry succeeds, the result is **Pass** (or **Warn** for a 4xx/5xx from the origin). If the retry is still rejected, or the proxy only offers Basic authentication, the URL is reported as **Fail**.
+<a id="about-http-407"></a>
+> **About HTTP 407**: `407 Proxy Authentication Required` means the proxy is
+> requesting authentication. The script retries the request based on what the
+> proxy advertises in `Proxy-Authenticate`:
+> - **Negotiate / Kerberos / NTLM** — retried with the **current Windows user's
+>   credentials** (Integrated Authentication).
+> - **Basic** — retried with credentials read from the local UiPath proxy
+>   configuration files, in this priority order:
+>   1. `C:\ProgramData\UiPath\Shared\proxy.json`
+>   2. `C:\Program Files\UiPath\Studio\uipath.config` (the `<webProxySettings>` section)
+>
+>   If a `Domain` is present in the file, both `UserName` and
+>   `Domain\UserName` are tried (proxies differ in the form they accept). If
+>   `Domain` is empty, only the plain `UserName` is sent.
+>
+> At startup the script runs a one-shot CONNECT probe to the system proxy so
+> it can still pick the right retry path on PowerShell 5.1, which otherwise
+> hides the `Proxy-Authenticate` header on HTTPS CONNECT failures. The probe
+> result is printed as `[Info] Proxy auth schemes advertised by ...`.
+>
+> If the retry succeeds, the URL is reported as **Pass** (or **Warn** for a
+> 4xx/5xx from the origin). If every retry is still rejected, the URL is
+> reported as **Fail**.
 
 > **About HTTP 403**: A 403 response is classified by looking at who returned it:
 > - **Fail** — the 403 came from an intermediate proxy (detected via generic markers: `Via`, `Proxy-Connection`, `X-Cache`, `X-Cache-Lookup`, a `Server` header containing `proxy` / `cache` / `gateway`, or error-page body markers such as `proxy`, `gateway`, `cache administrator`, or the phrase `requested URL could not be retrieved`). The request was blocked before reaching the origin, so the firewall/proxy requirement is not satisfied.
@@ -158,6 +187,14 @@ If the previous result CSV is still open in Excel, the write will fail. In that 
 
 - In a proxy environment, confirm that PowerShell is picking up the proxy configuration.
 - Corporate SSL inspection appliances may cause SSL/TLS errors. If so, verify that the enterprise root CA is installed in the trust store.
+
+### Every URL fails with `HTTP 407 ... rejected`
+
+The proxy is requesting authentication but your credentials are not being accepted.
+
+1. Check the `[Info] Loaded proxy credentials:` line printed at startup. If it reports `No UiPath proxy credentials found`, place a valid `proxy.json` at `C:\ProgramData\UiPath\Shared\proxy.json` (or populate `<webProxySettings>` in `C:\Program Files\UiPath\Studio\uipath.config`).
+2. Check the `[Info] Proxy auth schemes advertised by ...` line. If it lists something other than `Basic` / `Negotiate` / `NTLM` / `Kerberos`, the proxy is using a scheme the script does not support.
+3. Re-run with `-DebugProxyAuth` to see the full CONNECT trace (request and the proxy's error response) for each credential variant. The trace makes it easy to tell whether the password is wrong, the `Domain` field should be empty, or the proxy is rejecting the user account itself.
 
 ### Cannot run due to ExecutionPolicy
 

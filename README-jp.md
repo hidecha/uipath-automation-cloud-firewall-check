@@ -17,7 +17,10 @@ UiPath Automation Cloud をネットワークから利用するために許可�
 - 各 URL の **応答時間 (ms)** を計測して記録
 - 結果を **UTF-8 BOM 付き CSV** に出力（Excel でそのまま開いても文字化けしない）
 - 判定区分は **Pass / Warn / Fail / Skip** の 4 種類
-- **HTTP 407 (プロキシ認証要求) を受けた場合は Negotiate / Kerberos / NTLM (Windows 統合認証) を使って現在ログオン中の OS 資格情報で自動リトライ**。対話プロンプトは出ません。
+- **HTTP 407 (プロキシ認証要求) を受けた場合は自動リトライ**:
+  - **Negotiate / Kerberos / NTLM** → 現在ログオン中の Windows ユーザー資格情報（統合認証）。
+  - **Basic** → UiPath のローカル設定ファイル (`C:\ProgramData\UiPath\Shared\proxy.json`、なければ `C:\Program Files\UiPath\Studio\uipath.config`) から資格情報を読み込んで使用。Domain が設定されている場合は `UserName` と `Domain\UserName` の両方の形式を試行します（プロキシごとに要求する形式が異なるため）。
+  - 対話プロンプトは出ません。
 - **HTTP 403 は「中間プロキシによる遮断 (Fail)」と「Web サーバ側の 403 応答 (Warn)」を自動で切り分け**。判定はベンダ非依存の汎用シグナルに基づきます。
 
 ---
@@ -29,7 +32,7 @@ UiPath Automation Cloud をネットワークから利用するために許可�
 | OS | Windows 10 / 11, Windows Server 2016+ |
 | PowerShell | Windows PowerShell 5.1 または PowerShell 7.x どちらも動作 |
 | ネットワーク | チェック対象 URL へ HTTPS (443 / 80) で発信可能であること |
-| プロキシ | システム設定のプロキシ (IE/Edge 設定) が自動で使われます。Kerberos / NTLM / Negotiate 認証のプロキシは現在の Windows 資格情報で透過的に通過します |
+| プロキシ | システム設定のプロキシ (IE/Edge 設定) が自動で使われます。Kerberos / NTLM / Negotiate 認証は現在の Windows 資格情報で透過的に通過。Basic 認証は UiPath のローカル設定ファイルから資格情報を取得して使用します（詳細は[HTTP 407 の扱い](#http-407-の扱い)を参照） |
 
 > ※ 社内プロキシ経由では一部 URL が 4xx/5xx を返す場合があります（`Warn` 扱い）。疎通そのものは成立しているため、ファイアウォール要件としては到達可能と判断できます。
 >
@@ -91,6 +94,7 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 |---|---|---|
 | `-OutputPath` | `{スクリプトと同じフォルダ}\AutomationCloudFirewall-CheckResult.csv` | CSV の出力先パス |
 | `-TimeoutSec` | `15` | 1 URL あたりの接続タイムアウト秒数 |
+| `-DebugProxyAuth` | off | Basic 認証リトライ時の生 CONNECT リクエスト / レスポンスをコンソールに表示します。トレースにはプロキシのエラーページ本文と一部マスクされた Base64 トークンが含まれるため、407 の調査時のみ有効化してください。 |
 
 ---
 
@@ -115,7 +119,18 @@ CSV のヘッダー行は英語です。
 | **Fail** | **ネットワーク到達不可**、または中間プロキシによる遮断 / 認証拒否。ファイアウォール / プロキシ / DNS の問題が疑われる | タイムアウト / 名前解決失敗 / 接続拒否 / SSL・TLS エラー / **HTTP 407 (統合認証リトライ後も拒否)** / **HTTP 403 (中間プロキシ発)** |
 | **Skip** | チェック対象外 | URL にワイルドカード `*` を含む |
 
-> **HTTP 407 の扱い**: `407 Proxy Authentication Required` はプロキシが認証を要求している状態です。`Proxy-Authenticate` ヘッダが Negotiate / Kerberos / NTLM を提示している場合、スクリプトは **現在ログオン中の Windows ユーザーの資格情報 (統合認証)** で自動的にリトライします。リトライが成功すれば **Pass** (オリジンが 4xx/5xx を返したときは **Warn**) になります。統合認証でも拒否された場合、またはプロキシが Basic 認証のみを提示する場合は **Fail** です。
+<a id="http-407-の扱い"></a>
+> **HTTP 407 の扱い**: `407 Proxy Authentication Required` はプロキシが認証を要求している状態です。スクリプトは `Proxy-Authenticate` ヘッダで広告されたスキームに応じて自動リトライします。
+> - **Negotiate / Kerberos / NTLM** — **現在ログオン中の Windows ユーザーの資格情報 (統合認証)** でリトライ。
+> - **Basic** — UiPath のローカル設定ファイルから資格情報を読み込んでリトライ。優先順位:
+>   1. `C:\ProgramData\UiPath\Shared\proxy.json`
+>   2. `C:\Program Files\UiPath\Studio\uipath.config` の `<webProxySettings>` セクション
+>
+>   設定ファイルの `Domain` が入っている場合は `UserName` と `Domain\UserName` の両方を順番に試行します（プロキシにより要求する形式が異なるため）。`Domain` が空の場合はそのままの `UserName` のみ送信します。
+>
+> 起動時に 1 回だけシステムプロキシに対して CONNECT プローブを送り、`Proxy-Authenticate` ヘッダを直接読み取ります（PowerShell 5.1 では HTTPS CONNECT 失敗時にヘッダが隠れてしまうため）。プローブ結果は `[Info] Proxy auth schemes advertised by ...` として表示されます。
+>
+> リトライが成功すれば **Pass** (オリジンが 4xx/5xx を返したときは **Warn**) です。すべてのリトライで拒否された場合は **Fail** になります。
 
 > **HTTP 403 の扱い**: 403 を誰が返したかで分類します。
 > - **Fail** — 中間プロキシが返した 403。判定には汎用 (ベンダ非依存) なシグナルを使用: `Via` / `Proxy-Connection` / `X-Cache` / `X-Cache-Lookup` ヘッダ、`Server` ヘッダに `proxy` / `cache` / `gateway` を含む、あるいはエラーページ本文に `proxy` / `gateway` / `cache administrator` / `requested URL could not be retrieved` といった語句が含まれる場合。上流に到達できていないためファイアウォール / プロキシ設定の見直しが必要です。
@@ -157,6 +172,14 @@ https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 afte
 
 - プロキシ環境の場合は PowerShell にプロキシ設定が反映されているか確認してください。
 - 会社のセキュリティ製品による SSL インスペクションが原因で SSL/TLS エラーになっているケースがあります。その場合は信頼された CA のインストール状況を確認してください。
+
+### `HTTP 407 ... rejected` で Fail になる
+
+プロキシが認証を要求しているが、資格情報が受け入れられていない状態です。
+
+1. 起動時に表示される `[Info] Loaded proxy credentials:` の行を確認してください。`No UiPath proxy credentials found` と表示された場合は、`C:\ProgramData\UiPath\Shared\proxy.json` に有効な `proxy.json` を配置するか、`C:\Program Files\UiPath\Studio\uipath.config` の `<webProxySettings>` セクションを設定してください。
+2. `[Info] Proxy auth schemes advertised by ...` の行を確認してください。`Basic` / `Negotiate` / `NTLM` / `Kerberos` 以外が表示されている場合、本スクリプトが対応しない認証方式をプロキシが使用しています。
+3. `-DebugProxyAuth` スイッチを付けて再実行すると、Basic 認証の各バリアントに対する CONNECT リクエスト / レスポンスの内容がトレース表示されます。これによりパスワードが違う / `Domain` を空にすべきだった / ユーザーアカウント自体が拒否されている、等の切り分けが容易になります。
 
 ### ExecutionPolicy で実行できない
 
