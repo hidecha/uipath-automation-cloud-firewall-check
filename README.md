@@ -27,8 +27,12 @@ Reference: [Configuring the firewall for Automation Cloud (UiPath official docum
     configured, because proxies differ in which form they expect.
   - No interactive prompt is shown.
 - **HTTP 403 is split** into `Fail` (blocked by an intermediate proxy) and
-  `Warn` (returned by the origin web server). The decision is made from
-  generic, vendor-neutral signals in the response headers and body.
+  `Warn` (returned by the origin web server). For HTTPS targets the decision
+  is made by a socket-level `CONNECT` probe against the system proxy, which
+  makes the result identical across Windows PowerShell 5.1 and PowerShell 7+.
+- **Proxy-detection diagnostic lines** (scheme list and the loaded proxy
+  credentials, with the password masked) are appended to the CSV after the
+  data rows, separated by a blank line.
 
 ---
 
@@ -149,10 +153,24 @@ CSV: C:\...\AutomationCloudFirewall-CheckResult.csv
 > reported as **Fail**.
 
 > **About HTTP 403**: A 403 response is classified by looking at who returned it:
-> - **Fail** — the 403 came from an intermediate proxy (detected via generic markers: `Via`, `Proxy-Connection`, `X-Cache`, `X-Cache-Lookup`, a `Server` header containing `proxy` / `cache` / `gateway`, or error-page body markers such as `proxy`, `gateway`, `cache administrator`, or the phrase `requested URL could not be retrieved`). The request was blocked before reaching the origin, so the firewall/proxy requirement is not satisfied.
-> - **Warn** — the 403 came from the origin web server (none of the proxy markers are present). Reachability itself is fine; the server simply returned 403 for an unauthenticated GET against the root path.
+> - **Fail** — the 403 came from an intermediate proxy. The request was blocked before reaching the origin, so the firewall/proxy requirement is not satisfied.
+> - **Warn** — the 403 came from the origin web server. Reachability itself is fine; the server simply returned 403 for an unauthenticated GET against the root path.
 >
-> Proxy-origin detection is **skipped when no system proxy is configured** for the URL, because in that case a 403 cannot have come from a corporate blocking proxy. This avoids false `Fail` results when the origin or its CDN happens to emit markers the generic detector would otherwise pick up (e.g. Azure Front Door in front of `pkgs.dev.azure.com` returning `X-Cache` headers or the word `gateway` in its error page).
+> Proxy-origin detection is **skipped when no system proxy is configured** for the URL, because in that case a 403 cannot have come from a corporate blocking proxy. This avoids false `Fail` results when the origin or its CDN happens to emit headers or error-page text the generic heuristics would otherwise pick up (e.g. Azure Front Door in front of `pkgs.dev.azure.com` returning `X-Cache` headers or the word `gateway` in its error page).
+>
+> For **HTTPS** targets with a proxy configured, the decision is made by a
+> socket-level `CONNECT host:443` probe against the system proxy:
+> - The proxy returns `2xx` → the tunnel is allowed → the 403 must have come from origin → `Warn`.
+> - The proxy returns `4xx/5xx` (excluding `401/407`) → the proxy itself refuses the tunnel → `Fail`.
+> - The proxy returns `407` / `401` → auth challenge to our unauthenticated probe (inconclusive). Fall back to the elapsed-time tiebreaker: a proxy rejection returns from the LAN in a few milliseconds, while an end-to-end origin 403 carries internet-scale RTT (the cutoff is 50 ms).
+>
+> Using the socket-level answer means the classification is **identical on Windows PowerShell 5.1 and PowerShell 7+**, which previously differed because the two runtimes surface different amounts of proxy-side information on a failed response.
+>
+> For **HTTP** targets (no tunnel), the classification falls back to the
+> classic header/body heuristics: `Via`, `Proxy-Connection`, `X-Cache`,
+> `X-Cache-Lookup`, a `Server` header containing `proxy` / `cache` /
+> `gateway`, or body markers such as `cache administrator` or
+> `requested URL could not be retrieved`.
 
 > **Tip**: From a firewall requirement standpoint, **`Warn` is acceptable**. 4xx/5xx commonly happen when the server requires authentication or when the root path simply serves no content, and do not indicate a reachability problem.
 >
@@ -175,7 +193,15 @@ https://platform-cdn.uipath.com,Automation Cloud portal / Basic authentication s
 https://service.signalr.net,Task Mining / SignalR,Fail,45,DNS resolution failure
 https://gallery.uipath.com,Automation Cloud portal / UiPath Studio sign-in,Fail,4,HTTP 403 from intermediate proxy (blocked upstream)
 https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 after retry (Negotiate, OS credentials rejected)
+
+[Info] Proxy auth schemes advertised by http://proxy01.lab.test:8080/: Negotiate
+[Info] Loaded proxy credentials: Source=C:\Program Files\UiPath\Studio\uipath.config, UserName=admin01, Domain=(empty), Password=***, ProxyAddress=http://proxy01.lab.test:8080
 ```
+
+> **Note**: The CSV footer includes the detected proxy scheme, credential
+> source file, and user name (the password is always masked as `***`).
+> Review the footer before sharing the CSV externally if those details are
+> considered sensitive in your environment.
 
 ---
 

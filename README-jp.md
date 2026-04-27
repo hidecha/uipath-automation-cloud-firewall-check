@@ -21,7 +21,8 @@ UiPath Automation Cloud をネットワークから利用するために許可�
   - **Negotiate / Kerberos / NTLM** → 現在ログオン中の Windows ユーザー資格情報（統合認証）。
   - **Basic** → UiPath のローカル設定ファイル (`C:\ProgramData\UiPath\Shared\proxy.json`、なければ `C:\Program Files\UiPath\Studio\uipath.config`) から資格情報を読み込んで使用。Domain が設定されている場合は `UserName` と `Domain\UserName` の両方の形式を試行します（プロキシごとに要求する形式が異なるため）。
   - 対話プロンプトは出ません。
-- **HTTP 403 は「中間プロキシによる遮断 (Fail)」と「Web サーバ側の 403 応答 (Warn)」を自動で切り分け**。判定はベンダ非依存の汎用シグナルに基づきます。
+- **HTTP 403 は「中間プロキシによる遮断 (Fail)」と「Web サーバ側の 403 応答 (Warn)」を自動で切り分け**。HTTPS 対象ではシステムプロキシに対するソケットレベルの `CONNECT` プローブで判定するため、**Windows PowerShell 5.1 と PowerShell 7+ で同じ結果**になります。
+- **プロキシ検出の診断行**（スキーム一覧、読み込んだプロキシ資格情報（パスワードはマスク済み））は CSV データ行の末尾に空行を挟んで追記されます。
 
 ---
 
@@ -133,10 +134,19 @@ CSV のヘッダー行は英語です。
 > リトライが成功すれば **Pass** (オリジンが 4xx/5xx を返したときは **Warn**) です。すべてのリトライで拒否された場合は **Fail** になります。
 
 > **HTTP 403 の扱い**: 403 を誰が返したかで分類します。
-> - **Fail** — 中間プロキシが返した 403。判定には汎用 (ベンダ非依存) なシグナルを使用: `Via` / `Proxy-Connection` / `X-Cache` / `X-Cache-Lookup` ヘッダ、`Server` ヘッダに `proxy` / `cache` / `gateway` を含む、あるいはエラーページ本文に `proxy` / `gateway` / `cache administrator` / `requested URL could not be retrieved` といった語句が含まれる場合。上流に到達できていないためファイアウォール / プロキシ設定の見直しが必要です。
-> - **Warn** — Web サーバ自身が返した 403 (上記マーカーが一切検出されないケース)。ネットワーク到達性自体は問題なく、サーバがルートパスに対して未認証 GET を拒否しているだけのことが多いです。
+> - **Fail** — 中間プロキシが返した 403。上流に到達できていないためファイアウォール / プロキシ設定の見直しが必要です。
+> - **Warn** — Web サーバ自身が返した 403。ネットワーク到達性自体は問題なく、サーバがルートパスに対して未認証 GET を拒否しているだけのことが多いです。
 >
 > **システムプロキシが未設定の環境では「中間プロキシ由来」の判定自体をスキップ** し、常に **Warn** として扱います。プロキシ非経由の場合、403 は必ずオリジン (または正規の CDN) 由来のため、誤判定を避けるためです（例: `pkgs.dev.azure.com` の前段 Azure Front Door が `X-Cache` ヘッダやエラーページに `gateway` の語を含めるケース）。
+>
+> プロキシが設定された **HTTPS** 対象では、システムプロキシへ直接 `CONNECT host:443` をソケットレベルで送って判定します:
+> - プロキシが `2xx` を返した → トンネル許可 → 403 はオリジン発 → `Warn`
+> - プロキシが `4xx/5xx` (`401/407` 以外) を返した → プロキシがトンネル自体を拒否 → `Fail`
+> - プロキシが `407` / `401` を返した → 未認証プローブへの認証要求で判断不能。**応答時間** でタイブレーク: プロキシ拒否は LAN 内応答なので数 ms、オリジン 403 はインターネット RTT (50 ms をカットオフとして使用)。
+>
+> ソケットレベルの応答は PowerShell バージョンに依存しないため、**Windows PowerShell 5.1 と PowerShell 7+ で同じ結果**になります (以前は両者でプロキシ側の情報が異なる形で例外に載っていたため結果がずれていました)。
+>
+> **HTTP** 対象 (トンネル不要) の場合は、従来のヘッダ / 本文ヒューリスティック (`Via` / `Proxy-Connection` / `X-Cache` / `X-Cache-Lookup`、`Server` に `proxy` / `cache` / `gateway` を含む、本文に `cache administrator` / `requested URL could not be retrieved` を含む、等) にフォールバックします。
 
 > **ポイント**: ファイアウォール要件の観点では **Warn は許容** です。4xx/5xx は「サーバに到達した上で認証が必要」「そもそもルートパスにコンテンツがない」といった理由で発生するためで、到達性に問題はありません。
 >
@@ -160,7 +170,14 @@ https://platform-cdn.uipath.com,Automation Cloud portal / Basic authentication s
 https://service.signalr.net,Task Mining / SignalR,Fail,45,DNS resolution failure
 https://gallery.uipath.com,Automation Cloud portal / UiPath Studio sign-in,Fail,4,HTTP 403 from intermediate proxy (blocked upstream)
 https://example.proxy-required.local,(proxy auth required),Fail,12,HTTP 407 after retry (Negotiate, OS credentials rejected)
+
+[Info] Proxy auth schemes advertised by http://proxy01.lab.test:8080/: Negotiate
+[Info] Loaded proxy credentials: Source=C:\Program Files\UiPath\Studio\uipath.config, UserName=admin01, Domain=(empty), Password=***, ProxyAddress=http://proxy01.lab.test:8080
 ```
+
+> **注意**: CSV 末尾には検出したプロキシスキーム、資格情報の取得元ファイル、
+> ユーザー名が含まれます (パスワードは常に `***` でマスクされます)。
+> CSV を社外に共有する際は、これらの情報が機微情報に該当しないか確認してください。
 
 ---
 

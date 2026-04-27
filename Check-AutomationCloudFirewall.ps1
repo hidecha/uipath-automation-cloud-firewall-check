@@ -541,11 +541,10 @@ function Get-UiPathProxyCredential {
     if ($null -ne $cred) {
         $domainLabel = if ([string]::IsNullOrEmpty([string]$cred.Domain)) { '(empty)' } else { $cred.Domain }
         $passLabel   = if ([string]::IsNullOrEmpty([string]$cred.Password)) { '(empty)' } else { '***' }
-        Write-Host ("[Info] Loaded proxy credentials: Source={0}, UserName={1}, Domain={2}, Password={3}, ProxyAddress={4}" `
-                        -f $cred.Source, $cred.UserName, $domainLabel, $passLabel, $cred.ProxyAddress) `
-                   -ForegroundColor DarkCyan
+        Write-InfoLine ("[Info] Loaded proxy credentials: Source={0}, UserName={1}, Domain={2}, Password={3}, ProxyAddress={4}" `
+                            -f $cred.Source, $cred.UserName, $domainLabel, $passLabel, $cred.ProxyAddress)
     } else {
-        Write-Host '[Info] No UiPath proxy credentials found (checked proxy.json then uipath.config).' -ForegroundColor DarkCyan
+        Write-InfoLine '[Info] No UiPath proxy credentials found (checked proxy.json then uipath.config).'
     }
 
     $script:UiPathProxyCredentialCache     = $cred
@@ -784,6 +783,74 @@ function Get-ProxyAuthSchemesFromConnect {
     }
 
     return $schemes.ToArray()
+}
+
+function Get-ProxyConnectStatusCode {
+    <#
+        Sends a raw HTTPS CONNECT to $ProxyUrl for $TargetUrl and returns the
+        HTTP status code from the proxy's response, or $null on any failure.
+
+        Why this exists:
+        PowerShell 7 uses HttpClient, and when a corporate proxy rejects a
+        CONNECT with 4xx/5xx the proxy's response body/headers usually do
+        not surface on the resulting exception (unlike PS 5.1's
+        HttpWebRequest). That breaks the header/body heuristics that
+        distinguish "proxy blocked CONNECT" from "origin returned 403".
+        A direct socket-level CONNECT lets us ask the proxy verbatim, so
+        classification becomes consistent across PS 5.1 and PS 7+.
+    #>
+    param(
+        [string]$ProxyUrl,
+        [string]$TargetUrl,
+        [int]$TimeoutSec = 5
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProxyUrl))  { return $null }
+    if ([string]::IsNullOrWhiteSpace($TargetUrl)) { return $null }
+
+    try {
+        $proxyUri  = [Uri]$ProxyUrl
+        $targetUri = [Uri]$TargetUrl
+    } catch {
+        return $null
+    }
+
+    $proxyHost = $proxyUri.Host
+    $proxyPort = if ($proxyUri.Port -gt 0) { $proxyUri.Port } else { 8080 }
+    $tgtHost   = $targetUri.Host
+    $tgtPort   = if ($targetUri.Port -gt 0) { $targetUri.Port } else { 443 }
+
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $tcp.SendTimeout    = $TimeoutSec * 1000
+        $tcp.ReceiveTimeout = $TimeoutSec * 1000
+        $async = $tcp.BeginConnect($proxyHost, $proxyPort, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutSec * 1000, $false)) {
+            return $null
+        }
+        $tcp.EndConnect($async)
+
+        $stream = $tcp.GetStream()
+        $stream.ReadTimeout  = $TimeoutSec * 1000
+        $stream.WriteTimeout = $TimeoutSec * 1000
+
+        $req = "CONNECT {0}:{1} HTTP/1.1`r`nHost: {0}:{1}`r`nProxy-Connection: close`r`n`r`n" -f $tgtHost, $tgtPort
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($req)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
+        $first  = $reader.ReadLine()
+        if ($null -ne $first -and $first -match '^HTTP/\d\.\d\s+(\d{3})') {
+            return [int]$Matches[1]
+        }
+    } catch {
+        return $null
+    } finally {
+        try { $tcp.Close() } catch { }
+    }
+
+    return $null
 }
 
 function Invoke-HttpWebRequestBasic {
@@ -1200,18 +1267,54 @@ function Test-UrlConnection {
                     }
                 }
 
-                $respForHeaders = $null
-                try { $respForHeaders = $ex.Response } catch { }
+                # Authoritative signal for HTTPS: ask the system proxy
+                # directly whether it tunnels CONNECT to this target.
+                #   - 2xx           => proxy permits the tunnel => origin 403 => Warn.
+                #   - 407 / 401     => proxy is demanding auth from our
+                #                      *unauthenticated* probe; this tells us
+                #                      nothing about whether the target itself
+                #                      is blocked, so defer to the elapsed-time
+                #                      tiebreaker below.
+                #   - other 4xx/5xx => proxy itself refuses the tunnel => Fail.
+                # The probe is needed because PowerShell 5.1 and 7 differ in
+                # which proxy-side details surface on a 403, so the header /
+                # body heuristics produce inconsistent results across versions.
+                $fromProxy = $null
+                if ($Url -match '^https://') {
+                    $connectStatus = Get-ProxyConnectStatusCode -ProxyUrl $systemProxy -TargetUrl $Url -TimeoutSec 5
+                    if ($null -ne $connectStatus) {
+                        if ($connectStatus -ge 200 -and $connectStatus -lt 300) {
+                            $fromProxy = $false
+                        } elseif ($connectStatus -eq 407 -or $connectStatus -eq 401) {
+                            # Auth challenge - inconclusive.
+                        } elseif ($connectStatus -ge 400) {
+                            $fromProxy = $true
+                        }
+                    }
 
-                $fromProxy = Test-ResponseIsFromProxy -Response $respForHeaders
+                    # Response-time tiebreaker for HTTPS. A proxy refusing
+                    # the request answers from the LAN in a handful of
+                    # milliseconds; an end-to-end 403 from origin carries
+                    # internet-scale RTT. Observed data shows >250 ms for
+                    # every genuine origin 403 and <15 ms for every proxy
+                    # block, so 50 ms is a conservative cutoff.
+                    if ($null -eq $fromProxy) {
+                        $fromProxy = ($elapsedMs -lt 50)
+                    }
+                }
 
-                # Body-level fallback: HTTPS CONNECT failures often do not
-                # surface the proxy's response headers on PowerShell 5.1,
-                # but the HTML error page body is still available via
-                # ErrorDetails.Message.
-                if (-not $fromProxy) {
-                    $body = Get-ErrorResponseBody -ErrorRecord $err
-                    if (Test-BodyIsFromProxy -Body $body) { $fromProxy = $true }
+                # HTTP (non-HTTPS) targets: no CONNECT tunnel. A blocking
+                # proxy serves an HTML error page directly, so the classic
+                # header / body markers remain reliable here.
+                if ($null -eq $fromProxy) {
+                    $respForHeaders = $null
+                    try { $respForHeaders = $ex.Response } catch { }
+
+                    $fromProxy = [bool](Test-ResponseIsFromProxy -Response $respForHeaders)
+                    if (-not $fromProxy) {
+                        $body = Get-ErrorResponseBody -ErrorRecord $err
+                        if (Test-BodyIsFromProxy -Body $body) { $fromProxy = $true }
+                    }
                 }
 
                 if ($fromProxy) {
@@ -1325,6 +1428,25 @@ $script:DebugProxyAuthEnabled    = [bool]$DebugProxyAuth
 $script:ProbedProxySchemes       = @()
 $script:BasicProbeLoggedVariants = New-Object System.Collections.Generic.HashSet[string]
 
+# Collected [Info] lines about proxy scheme detection and credential loading.
+# Appended to the CSV output after the data rows (separated by a blank line)
+# so the result file carries enough context to diagnose proxy-auth issues
+# without re-running the script.
+$script:InfoLines = New-Object System.Collections.Generic.List[string]
+
+function Write-InfoLine {
+    <#
+        Mirror of Write-Host for [Info] diagnostics that also records the line
+        into $script:InfoLines so it can be appended to the CSV later.
+    #>
+    param(
+        [string]$Message,
+        [System.ConsoleColor]$ForegroundColor = [System.ConsoleColor]::DarkCyan
+    )
+    Write-Host $Message -ForegroundColor $ForegroundColor
+    [void]$script:InfoLines.Add($Message)
+}
+
 # One-time proxy-authentication probe. Runs a raw CONNECT against the system
 # proxy for a representative target so we can read the Proxy-Authenticate
 # header values directly - Invoke-WebRequest on PS 5.1 hides them on HTTPS
@@ -1339,18 +1461,17 @@ try {
                                         -TargetUrl $probeTarget `
                                         -TimeoutSec 5
         if ($script:ProbedProxySchemes -and $script:ProbedProxySchemes.Count -gt 0) {
-            Write-Host ("[Info] Proxy auth schemes advertised by {0}: {1}" `
-                            -f $probeProxy, ($script:ProbedProxySchemes -join ', ')) `
-                       -ForegroundColor DarkCyan
+            Write-InfoLine ("[Info] Proxy auth schemes advertised by {0}: {1}" `
+                                -f $probeProxy, ($script:ProbedProxySchemes -join ', '))
         } else {
-            Write-Host ("[Info] Proxy {0} did not advertise any Proxy-Authenticate scheme on CONNECT probe." `
-                            -f $probeProxy) -ForegroundColor DarkCyan
+            Write-InfoLine ("[Info] Proxy {0} did not advertise any Proxy-Authenticate scheme on CONNECT probe." `
+                                -f $probeProxy)
         }
     } else {
-        Write-Host "[Info] No system proxy configured for probe target." -ForegroundColor DarkCyan
+        Write-InfoLine "[Info] No system proxy configured for probe target."
     }
 } catch {
-    Write-Host ("[Info] Proxy auth probe failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkCyan
+    Write-InfoLine ("[Info] Proxy auth probe failed: {0}" -f $_.Exception.Message)
 }
 
 # Pre-load UiPath proxy credentials eagerly so the "Loaded proxy credentials"
@@ -1429,6 +1550,15 @@ if ($outputDir -and -not (Test-Path $outputDir)) {
 #   - PowerShell 5.1 writes BOM with -Encoding UTF8.
 # To paper over the difference, serialize first then write with .NET UTF8Encoding(true).
 $csvText = ($results | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
+
+# Append collected [Info] diagnostic lines (proxy scheme detection,
+# credential loading) after the CSV data, separated by a blank line so
+# Excel treats the log block as a visually separate section.
+if ($script:InfoLines.Count -gt 0) {
+    $infoBlock = [string]::Join("`r`n", $script:InfoLines)
+    $csvText   = "$csvText`r`n`r`n$infoBlock"
+}
+
 $utf8Bom  = New-Object System.Text.UTF8Encoding($true)
 
 # .NET uses its own current directory, so resolve to an absolute path first.
